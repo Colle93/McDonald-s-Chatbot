@@ -1,92 +1,178 @@
 import os
-from time import sleep
-from packaging import version
-import openai
-from openai import OpenAI
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
 import asyncio
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from openai import OpenAI
 
-# Controlliamo che la versione di OpenAI sia corretta
-required_version = version.parse("1.1.1")
-current_version = version.parse(openai.__version__)
-OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
-if current_version < required_version:
-  raise ValueError(f"Error: OpenAI version {openai.__version__}"
-                   " is less than the required version 1.1.1")
-else:
-  print("OpenAI version is compatible.")
+# =========================
+# Config & Client
+# =========================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ASSISTANT_ID = os.environ.get("ASSISTANT_ID")
 
-# Inizializziamo l'app FastAPI
-app = FastAPI()
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
+if not ASSISTANT_ID:
+    raise RuntimeError("Missing ASSISTANT_ID env var")
 
-# Inizializziamo il client di OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Carichiamo l'ID dell'assistente dalle variabili di ambiente
-assistant_id = os.environ['ASSISTANT_ID']
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(title="Voiceflow-Assistant Bridge")
 
-# Definiamo il modello di richiesta per la chat
+# CORS aperto (utile per tool diversi; Voiceflow tipicamente chiama da server)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+# =========================
+# Models
+# =========================
 class ChatRequest(BaseModel):
     thread_id: str
     message: str
 
-# Inizializziamo una conversazione
-@app.get('/start')
-async def start_conversation():
-  print("Starting a new conversation...")
-  thread = client.beta.threads.create()
-  print(f"New thread created with ID: {thread.id}")
-  return {"thread_id": thread.id}
+# =========================
+# Utils
+# =========================
+async def run_assistant_and_get_reply(thread_id: str, user_message: str) -> str:
+    """
+    1) Appende il messaggio dell'utente al thread
+    2) Avvia la run dell'assistente
+    3) Polla finché la run è 'completed' (o termina per errore)
+    4) Recupera il/i message_id creati dalla run tramite i run-steps
+    5) Estrae il testo dal/i messaggio/i dell'assistente (fallback: ultimo assistant nel thread)
+    """
+    # 1) append message
+    client.chat.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_message
+    )
 
-# Gestiamo il messaggio di chat
-@app.post('/chat')
-async def chat(chat_request: ChatRequest):
-  thread_id = chat_request.thread_id
-  user_input = chat_request.message
+    # 2) create run
+    run = client.chat.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
 
-  # Controlliamo che l'ID della conversazione sia stato fornito
-  if not thread_id:
-    print("Error: Missing thread_id")
-    raise HTTPException(status_code=400, detail="Missing thread_id")
+    # 3) poll
+    while True:
+        run = client.chat.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        status = getattr(run, "status", "unknown")
+        print(f"[RUN] status={status}")
+        if status in ("completed", "failed", "cancelled", "expired", "requires_action"):
+            break
+        await asyncio.sleep(0.6)
 
-  print(f"Received message: {user_input} for thread ID: {thread_id}")
+    if run.status != "completed":
+        # Non mandiamo errore 5xx a Voiceflow: restituiamo comunque JSON leggibile
+        return f"Errore: run status {run.status}"
 
-  # Inseriamo il messaggio dell'utente nella conversazione
-  client.beta.threads.messages.create(thread_id=thread_id,
-                                      role="user",
-                                      content=user_input)
+    # 4) steps → message_id creati da QUESTA run
+    steps = client.chat.runs.steps.list(thread_id=thread_id, run_id=run.id, order="asc", limit=50)
+    created_message_ids = []
+    for s in steps.data:
+        # gli step di creazione messaggio possono essere identificati da type
+        stype = getattr(s, "type", None)
+        if stype == "message_creation":
+            try:
+                mid = s.step_details.message_creation.message_id
+                if mid:
+                    created_message_ids.append(mid)
+            except Exception:
+                pass
 
-  # Creiamo la run per l'assistente
-  run = client.beta.threads.runs.create(thread_id=thread_id,
-                                        assistant_id=assistant_id)
-  
-  end = False
+    # 5) estrai il testo dai messaggi assistant creati da questa run
+    answer = None
+    if created_message_ids:
+        for mid in created_message_ids:
+            m = client.chat.messages.retrieve(thread_id=thread_id, message_id=mid)
+            if getattr(m, "role", "") == "assistant" and getattr(m, "content", None):
+                for part in m.content:
+                    # i content parts hanno .type (es. "output_text") e un .text.value
+                    text_obj = getattr(part, "text", None)
+                    if text_obj and getattr(text_obj, "value", None):
+                        answer = text_obj.value
+                        break
+            if answer:
+                break
 
-  # Polling per controllare lo stato della run 
-  while not end:
-    # Controlliamo lo stato della run
-    run_status = client.beta.threads.runs.retrieve(thread_id=thread_id,
-                                                   run_id=run.id)
-    print(f"Run status: {run_status.status}")
+    # Fallback: cerca l'ultimo messaggio assistant nel thread se per qualche motivo non troviamo dai steps
+    if not answer:
+        msgs = client.chat.messages.list(thread_id=thread_id, order="desc", limit=25)
+        for m in msgs.data:
+            if getattr(m, "role", "") == "assistant" and getattr(m, "content", None):
+                for part in m.content:
+                    text_obj = getattr(part, "text", None)
+                    if text_obj and getattr(text_obj, "value", None):
+                        answer = text_obj.value
+                        break
+            if answer:
+                break
 
-    if run_status.status == 'completed':
-      end = True
-     
-    elif run_status.status == "cancelling" or run_status.status == "requires_action" or run_status.status == "cancelled" or run_status.status == "expired":
-      end = True
+    if not answer:
+        answer = "Non ho trovato una risposta dall'assistente."
+    print(f"[ASSISTANT] {answer[:200]}{'...' if len(answer) > 200 else ''}")
+    return answer
 
-    elif run_status.status == "failed":
-      print(run.last_error)
-      end = True
-    
-    await asyncio.sleep(1)  
+# =========================
+# Routes
+# =========================
+@app.get("/health")
+def health():
+    return JSONResponse(content={"ok": True}, status_code=200)
 
-  # Recuperiamo i messaggi della conversazione
-  messages = client.beta.threads.messages.list(thread_id=thread_id)
-  # Recuperiamo il testo della risposta
-  response = messages.data[0].content[0].text.value
-  
-  print(f"Assistant response: {response}")
+@app.get("/version")
+def version():
+    return JSONResponse(content={"version": "chat-steps-v3"}, status_code=200)
 
-  return {"response": response}
+@app.get("/vf-test")
+def vf_test():
+    # endpoint di test per Voiceflow: deve catturare response.response -> "pong"
+    return JSONResponse(content={"response": "pong"}, status_code=200)
+
+@app.get("/start")
+def start_conversation():
+    """
+    Crea un nuovo thread per Voiceflow. In VF cattura:
+    response.body.thread_id  (se disponibile)
+    oppure, a seconda della tua versione: response.thread_id  o  response.body.response.thread_id
+    (Nel tuo workspace hai usato finora response.thread_id → adattati a quello che VF mostra)
+    """
+    thread = client.chat.threads.create()
+    print(f"[THREAD] created: {thread.id}")
+    return JSONResponse(content={"thread_id": thread.id}, status_code=200)
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    """
+    Body atteso:
+    {
+      "thread_id": "<thd_...>",
+      "message":   "<domanda_utente>"
+    }
+
+    Ritorna SEMPRE JSON:
+    { "response": "<testo assistant o errore leggibile>" }
+    """
+    thread_id = (req.thread_id or "").strip()
+    user_msg  = (req.message or "").strip()
+
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="Missing thread_id")
+    if not user_msg:
+        return JSONResponse(content={"response": "Dimmi qualcosa da inviare al bot."}, status_code=200)
+
+    try:
+        answer = await run_assistant_and_get_reply(thread_id, user_msg)
+        return JSONResponse(content={"response": answer}, status_code=200)
+    except Exception as e:
+        # log e risposta "safe" per Voiceflow
+        print(f"[ERROR] /chat: {e}")
+        return JSONResponse(content={"response": f"Errore interno: {e}"}, status_code=200)
